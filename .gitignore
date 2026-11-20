@@ -1,0 +1,88 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+venv/
+env/
+.venv/
+.env/
+
+# MediaPipe models (large files - will be auto-downloaded)
+models/*.task
+models/*.tflite
+
+# Logs and session data
+logs/
+*.log
+
+# Video recordings (output)
+recordings/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+
+# Test data (videos/images can be large)
+data/videos/*.mp4
+data/videos/*.avi
+data/videos/*.mov
+data/images/*.jpg
+data/images/*.png
+
+# Jupyter notebooks checkpoints
+.ipynb_checkpoints/
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
+
+# PyInstaller
+*.spec
+
+# Coverage reports
+htmlcov/
+.coverage
+.pytest_cache/
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# ---- standard ignores ----
+.DS_Store
+# secrets (keep locally, never commit)
+.env
+.env.*
+!.env.example
+# python
+venv/
+.venv/
+env/
+__pycache__/
+*.pyc
+*.egg-info/
+.ipynb_checkpoints/
+# node
+node_modules/
+dist/
+build/
+# editors / logs
+.idea/
+.vscode/
+*.log
+# local state
+instance/
+flask_session/
+uploads/
+*.sqlite
+*.sqlite3
+# ---- project-specific (large/generated) ----
+recordings/
+logs/
