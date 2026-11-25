@@ -1,0 +1,2 @@
+# Optional spoken warnings (pulls in pyobjc on macOS)
+pyttsx3>=2.90

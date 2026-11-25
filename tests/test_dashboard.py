@@ -1,11 +1,13 @@
 import json
+import os
 
 import pytest
 
 pytest.importorskip("streamlit")
 from streamlit.testing.v1 import AppTest
 
-APP = "src/dashboard/app.py"
+APP = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                   "src", "dashboard", "app.py")
 
 
 def test_dashboard_empty_state(tmp_path, monkeypatch):
