@@ -24,7 +24,19 @@ def test_flicker_cannot_spam_but_counts_episodes():
         d = m.update({'yawn': i % 2 == 0}, i * 0.1)
         fired += d.fire == 'yawn'
     assert fired == 1
-    assert m.episode_counts['yawn'] == 10
+    assert m.episode_counts['yawn'] == 1          # flicker within `rearm` = one episode
+
+
+def test_episode_rearms_after_inactive_gap():
+    m = AlertManager(cooldown=5.0, rearm=1.0)
+    m.update({'yawn': True}, 0.0)
+    m.update({}, 0.5)
+    m.update({'yawn': True}, 0.9)                 # gap < rearm: same episode
+    assert m.episode_counts['yawn'] == 1
+    m.update({}, 1.0)
+    m.update({}, 2.5)                             # gap >= rearm
+    m.update({'yawn': True}, 3.0)
+    assert m.episode_counts['yawn'] == 2
 
 
 def test_priority_and_no_alert_when_nothing_active():
