@@ -12,7 +12,13 @@ import json
 import os
 from pathlib import Path
 from datetime import datetime, timedelta
-import glob
+import sys
+
+# Allow `streamlit run src/dashboard/app.py` from any working directory
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from src.utils.config import (  # noqa: E402
+    ALERT_CONFIG, EYE_CONFIG, HEAD_POSE_CONFIG, LOGS_DIR, MOUTH_CONFIG, RECORDINGS_DIR,
+)
 
 
 # Page configuration
@@ -62,10 +68,10 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 
-def load_session_data(logs_dir: str = "logs"):
+def load_session_data(logs_dir=None):
     """Load all session data from logs directory."""
     sessions = []
-    logs_path = Path(logs_dir)
+    logs_path = Path(logs_dir) if logs_dir else _logs_dir()
     
     if not logs_path.exists():
         return []
@@ -95,6 +101,16 @@ def load_session_data(logs_dir: str = "logs"):
     # Sort by start time (newest first)
     sessions.sort(key=lambda x: x['summary'].get('start_time', ''), reverse=True)
     return sessions
+
+
+def _logs_dir():
+    """Resolved per call so DMS_LOGS_DIR changes take effect."""
+    return Path(os.environ.get('DMS_LOGS_DIR') or LOGS_DIR)
+
+
+def drowsy_events(summary):
+    """Distinct drowsiness events (legacy logs stored this under 'drowsy_frames')."""
+    return summary.get('drowsy_count', summary.get('drowsy_frames', 0))
 
 
 def create_gauge_chart(value, title, max_val=1.0, thresholds=None):
@@ -192,7 +208,7 @@ def create_metrics_over_time(events):
             row=1, col=1
         )
         # Add threshold line
-        fig.add_hline(y=0.25, line_dash="dash", line_color="red",
+        fig.add_hline(y=EYE_CONFIG.EAR_THRESHOLD, line_dash="dash", line_color="red",
                      annotation_text="Threshold", row=1, col=1)
     
     # MAR values
@@ -205,7 +221,7 @@ def create_metrics_over_time(events):
             row=2, col=1
         )
         # Add threshold line
-        fig.add_hline(y=0.6, line_dash="dash", line_color="red",
+        fig.add_hline(y=MOUTH_CONFIG.MAR_THRESHOLD, line_dash="dash", line_color="red",
                      annotation_text="Threshold", row=2, col=1)
     
     fig.update_layout(height=400, showlegend=True)
@@ -220,7 +236,6 @@ def main():
                 unsafe_allow_html=True)
     
     # Sidebar
-    st.sidebar.image("https://img.icons8.com/color/96/000000/car.png", width=80)
     st.sidebar.title("Navigation")
     
     page = st.sidebar.radio(
@@ -247,14 +262,14 @@ def show_overview(sessions):
     
     if not sessions:
         st.info("No sessions recorded yet. Run the Driver Monitoring System to generate data.")
-        st.code("python main.py", language="bash")
+        st.code("python main.py   # or: python main.py --video clip.mp4 --headless", language="bash")
         return
     
     # Aggregate statistics
     total_sessions = len(sessions)
     total_duration = sum(s['summary'].get('duration_seconds', 0) for s in sessions)
     total_events = sum(s['summary'].get('total_events', 0) for s in sessions)
-    total_drowsy = sum(s['summary'].get('drowsy_frames', 0) for s in sessions)
+    total_drowsy = sum(drowsy_events(s['summary']) for s in sessions)
     total_yawns = sum(s['summary'].get('yawn_count', 0) for s in sessions)
     total_distractions = sum(s['summary'].get('distraction_count', 0) for s in sessions)
     
@@ -262,16 +277,14 @@ def show_overview(sessions):
     col1, col2, col3, col4 = st.columns(4)
     
     with col1:
-        st.metric("Total Sessions", total_sessions, 
-                  delta=f"+{1 if len(sessions) > 0 else 0} today")
+        st.metric("Total Sessions", total_sessions)
     
     with col2:
         hours = total_duration / 3600
-        st.metric("Total Drive Time", f"{hours:.1f}h")
+        st.metric("Total Monitored Time", f"{hours:.1f}h")
     
     with col3:
-        st.metric("Total Alerts", total_events,
-                  delta_color="inverse")
+        st.metric("Total Alerts", total_events)
     
     with col4:
         avg_events_per_session = total_events / max(total_sessions, 1)
@@ -300,7 +313,7 @@ def show_overview(sessions):
                     },
                     hole=0.4)
         fig.update_layout(height=300)
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width='stretch')
     
     with col2:
         st.subheader("📅 Recent Sessions")
@@ -316,7 +329,7 @@ def show_overview(sessions):
             })
         
         if recent_data:
-            st.dataframe(pd.DataFrame(recent_data), use_container_width=True, hide_index=True)
+            st.dataframe(pd.DataFrame(recent_data), width='stretch', hide_index=True)
     
     st.divider()
     
@@ -346,7 +359,7 @@ def show_overview(sessions):
             }
         ))
         fig.update_layout(height=300)
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width='stretch')
 
 
 def show_session_analysis(sessions):
@@ -381,7 +394,7 @@ def show_session_analysis(sessions):
     with col2:
         st.metric("Total Frames", summary.get('total_frames', 0))
     with col3:
-        st.metric("Drowsy Events", summary.get('drowsy_frames', 0))
+        st.metric("Drowsy Events", drowsy_events(summary))
     with col4:
         st.metric("Yawn Count", summary.get('yawn_count', 0))
     with col5:
@@ -396,7 +409,7 @@ def show_session_analysis(sessions):
         st.subheader("📍 Event Timeline")
         timeline_fig = create_event_timeline(events)
         if timeline_fig:
-            st.plotly_chart(timeline_fig, use_container_width=True)
+            st.plotly_chart(timeline_fig, width='stretch')
         else:
             st.info("No events recorded in this session.")
     
@@ -421,14 +434,14 @@ def show_session_analysis(sessions):
     st.subheader("📊 Metrics Over Time")
     metrics_fig = create_metrics_over_time(events)
     if metrics_fig:
-        st.plotly_chart(metrics_fig, use_container_width=True)
+        st.plotly_chart(metrics_fig, width='stretch')
     else:
         st.info("Insufficient data for metrics visualization.")
     
     # Raw data
     with st.expander("🔍 View Raw Event Data"):
         if events:
-            st.dataframe(pd.DataFrame(events), use_container_width=True)
+            st.dataframe(pd.DataFrame(events), width='stretch')
         else:
             st.info("No events to display.")
 
@@ -439,27 +452,27 @@ def show_settings():
     st.header("⚙️ Settings")
     
     st.subheader("Detection Thresholds")
-    st.info("These are the current detection thresholds. Edit `src/utils/config.py` to change them.")
+    st.info("These are the current detection thresholds. Edit `src/utils/config.py` or set `DMS_*` environment variables (e.g. `DMS_EAR_THRESHOLD`).")
     
     col1, col2 = st.columns(2)
     
     with col1:
         st.markdown("### 👁️ Eye Tracking")
-        st.text("EAR Threshold: 0.25")
-        st.text("Consecutive Frames: 30")
+        st.text(f"EAR Threshold: {EYE_CONFIG.EAR_THRESHOLD}")
+        st.text(f"Eyes-closed time: {EYE_CONFIG.CLOSED_SECONDS}s")
         
         st.markdown("### 👄 Mouth Tracking")
-        st.text("MAR Threshold: 0.6")
-        st.text("Yawn Duration: 2.0s")
+        st.text(f"MAR Threshold: {MOUTH_CONFIG.MAR_THRESHOLD}")
+        st.text(f"Yawn Duration: {MOUTH_CONFIG.YAWN_DURATION}s")
     
     with col2:
         st.markdown("### 🔄 Head Pose")
-        st.text("Yaw Threshold: 30°")
-        st.text("Pitch Threshold: 20°")
-        st.text("Distraction Frames: 45")
+        st.text(f"Yaw Threshold: {HEAD_POSE_CONFIG.YAW_THRESHOLD} deg")
+        st.text(f"Pitch Threshold: {HEAD_POSE_CONFIG.PITCH_THRESHOLD} deg")
+        st.text(f"Distraction time: {HEAD_POSE_CONFIG.DISTRACTION_SECONDS}s")
         
         st.markdown("### 🔔 Alerts")
-        st.text("Alert Cooldown: 3.0s")
+        st.text(f"Alert Cooldown: {ALERT_CONFIG.ALERT_COOLDOWN}s")
     
     st.divider()
     
@@ -468,7 +481,7 @@ def show_settings():
     col1, col2 = st.columns(2)
     
     with col1:
-        logs_path = Path("logs")
+        logs_path = _logs_dir()
         if logs_path.exists():
             log_files = list(logs_path.glob("*"))
             st.text(f"Log files: {len(log_files)}")
@@ -476,7 +489,7 @@ def show_settings():
             st.text("Log directory: Not created yet")
     
     with col2:
-        recordings_path = Path("recordings")
+        recordings_path = RECORDINGS_DIR
         if recordings_path.exists():
             recordings = list(recordings_path.glob("*.mp4"))
             st.text(f"Recordings: {len(recordings)}")

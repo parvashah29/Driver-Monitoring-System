@@ -1,396 +1,246 @@
 #!/usr/bin/env python3
 """
-Driver Monitoring System - Main Application
-Real-time driver fatigue and distraction detection.
+Driver Monitoring System - command line application.
+Real-time driver drowsiness, yawn and distraction detection.
 
 Usage:
-    python main.py                    # Run with webcam
-    python main.py --video path/to/video.mp4  # Run with video file
-    python main.py --no-audio         # Disable audio alerts
-    python main.py --debug            # Enable debug visualization
+    python main.py                              # webcam, live window
+    python main.py --video clip.mp4             # analyse a video file
+    python main.py --video clip.mp4 --headless --report out.json   # no window, JSON stats
+    python main.py --video clip.mp4 --headless --save out.mp4      # write annotated video
+    python main.py --calibrate 5                # 5 s per-driver calibration at start
 """
 
 import argparse
-import time
-import cv2
-import sys
+import json
 import os
+import sys
+import time
 from datetime import datetime
+from typing import Optional
 
-# Add src to path
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'src'))
+import cv2
+import numpy as np
 
-from src.detector import (
-    FaceDetector, 
-    EyeTracker, 
-    MouthTracker, 
-    HeadPoseEstimator,
-    draw_eye_landmarks,
-    draw_mouth_landmarks,
-    draw_head_pose
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from src.alerts import AudioAlert, create_dashboard_overlay  # noqa: E402
+from src.detector import (  # noqa: E402
+    FaceDetector, draw_eye_landmarks, draw_head_pose, draw_mouth_landmarks,
 )
-from src.alerts import AudioAlert, VisualAlert, create_dashboard_overlay
-from src.utils import CAMERA_CONFIG, EYE_CONFIG, DMSLogger
+from src.detector.face_detector import ModelUnavailableError  # noqa: E402
+from src.pipeline import DMSPipeline, FrameResult  # noqa: E402
+from src.utils import CAMERA_CONFIG, EYE_CONFIG, DMSLogger  # noqa: E402
+from src.utils.config import RECORDINGS_DIR  # noqa: E402
 
 
-class DriverMonitoringSystem:
-    """
-    Main Driver Monitoring System application.
-    Combines all detection modules for real-time driver monitoring.
-    """
-    
-    def __init__(
-        self,
-        video_source: int = 0,
-        enable_audio: bool = True,
-        enable_logging: bool = True,
-        debug_mode: bool = False
-    ):
-        """
-        Initialize the Driver Monitoring System.
-        
-        Args:
-            video_source: Camera index or video file path
-            enable_audio: Whether to enable audio alerts
-            enable_logging: Whether to enable event logging
-            debug_mode: Whether to show debug visualizations
-        """
-        self.video_source = video_source
-        self.debug_mode = debug_mode
-        
-        # Initialize detectors
-        print("Initializing face detector...")
-        self.face_detector = FaceDetector(
-            detection_confidence=CAMERA_CONFIG.DETECTION_CONFIDENCE,
-            tracking_confidence=CAMERA_CONFIG.TRACKING_CONFIDENCE
+def annotate(frame: np.ndarray, result: FrameResult, fps: float, debug: bool, privacy: bool) -> np.ndarray:
+    """Draw landmarks (debug/privacy) and the HUD. Privacy mode replaces the image by black."""
+    if privacy:
+        frame = np.zeros_like(frame)
+    face = result.face_data
+    if face is not None and (debug or privacy):
+        FaceDetector.draw_landmarks(frame, face, draw_contours=True)
+        draw_eye_landmarks(frame, face, EYE_CONFIG.LEFT_EYE_INDICES, EYE_CONFIG.RIGHT_EYE_INDICES)
+        draw_mouth_landmarks(frame, face)
+        if result.head:
+            draw_head_pose(frame, face, result.head['pitch'], result.head['yaw'])
+    return create_dashboard_overlay(frame, result.eye, result.mouth, result.head, fps,
+                                    state=result.state)
+
+
+def open_source(args):
+    """Open the video file or webcam; returns (capture, is_file) or exits with a clear message."""
+    if args.video:
+        if not os.path.isfile(args.video):
+            sys.exit(f"Error: video file not found: {args.video}")
+        cap = cv2.VideoCapture(args.video)
+        if not cap.isOpened():
+            sys.exit(f"Error: could not decode video file: {args.video}")
+        return cap, True
+    cap = cv2.VideoCapture(args.camera)
+    if not cap.isOpened():
+        sys.exit(
+            f"Error: could not open camera {args.camera}.\n"
+            "  - Is a webcam connected and not used by another app?\n"
+            "  - macOS: grant camera access to your terminal (System Settings > Privacy & Security > Camera).\n"
+            "  - Try another index with --camera 1, or analyse a recording with --video PATH."
         )
-        
-        print("Initializing eye tracker...")
-        self.eye_tracker = EyeTracker()
-        
-        print("Initializing mouth tracker...")
-        self.mouth_tracker = MouthTracker()
-        
-        print("Initializing head pose estimator...")
-        self.head_pose = HeadPoseEstimator()
-        
-        # Initialize alerts
-        self.audio_alert = AudioAlert(enable_voice=True) if enable_audio else None
-        self.visual_alert = VisualAlert()
-        
-        # Initialize logger
-        self.logger = DMSLogger() if enable_logging else None
-        
-        # Video capture and recording
-        self.cap = None
-        self.video_writer = None
-        self.output_dir = "recordings"
-        os.makedirs(self.output_dir, exist_ok=True)
-        
-        # Performance tracking
-        self.fps_history = []
-        self.fps_history_size = 30
-        
-        # Alert state tracking (to prevent repeated alerts)
-        self._last_alert_type = None
-        self._alert_cooldown = 5.0  # seconds
-        self._last_alert_time = 0
-        
-        print("DMS initialized successfully!")
-    
-    def _calculate_fps(self, frame_time: float) -> float:
-        """Calculate smoothed FPS."""
-        fps = 1.0 / max(frame_time, 0.001)
-        self.fps_history.append(fps)
-        if len(self.fps_history) > self.fps_history_size:
-            self.fps_history.pop(0)
-        return sum(self.fps_history) / len(self.fps_history)
-    
-    def _should_alert(self, alert_type: str) -> bool:
-        """Check if we should trigger an alert (with cooldown)."""
-        current_time = time.time()
-        if (alert_type != self._last_alert_type or 
-            current_time - self._last_alert_time >= self._alert_cooldown):
-            self._last_alert_type = alert_type
-            self._last_alert_time = current_time
-            return True
-        return False
-    
-    def process_frame(self, frame: cv2.Mat) -> tuple:
-        """
-        Process a single frame through all detection modules.
-        
-        Args:
-            frame: BGR image from camera/video
-            
-        Returns:
-            Tuple of (processed_frame, results_dict)
-        """
-        # Detect face
-        face_data = self.face_detector.detect(frame)
-        
-        results = {
-            'face_detected': face_data is not None,
-            'eye': {},
-            'mouth': {},
-            'head': {},
-            'alert_level': 0
-        }
-        
-        if face_data is None:
-            # No face detected
-            frame = self.visual_alert.draw_face_indicator(frame, False)
-            
-            if self.audio_alert and self._should_alert('no_face'):
-                self.audio_alert.alert_no_face()
-            
-            return frame, results
-        
-        # Update all trackers
-        eye_results = self.eye_tracker.update(face_data)
-        mouth_results = self.mouth_tracker.update(face_data)
-        head_results = self.head_pose.update(face_data)
-        
-        results['eye'] = eye_results
-        results['mouth'] = mouth_results
-        results['head'] = head_results
-        
-        # Debug visualization
-        if self.debug_mode:
-            # Draw face landmarks
-            self.face_detector.draw_landmarks(frame, face_data, draw_contours=True)
-            
-            # Draw eye landmarks
-            draw_eye_landmarks(
-                frame, face_data,
-                EYE_CONFIG.LEFT_EYE_INDICES,
-                EYE_CONFIG.RIGHT_EYE_INDICES
-            )
-            
-            # Draw mouth landmarks
-            draw_mouth_landmarks(frame, face_data)
-            
-            # Draw head pose axes
-            draw_head_pose(
-                frame, face_data,
-                head_results['pitch'],
-                head_results['yaw'],
-                head_results['roll']
-            )
-        
-        # Check for alerts
-        if eye_results['is_drowsy']:
-            results['alert_level'] = 2
-            if self.audio_alert and self._should_alert('drowsy'):
-                self.audio_alert.alert_drowsy('critical')
-            if self.logger:
-                self.logger.log_drowsiness(eye_results['smoothed_ear'], 'critical')
-        
-        elif head_results['is_distracted']:
-            results['alert_level'] = 1
-            if self.audio_alert and self._should_alert('distracted'):
-                self.audio_alert.alert_distracted()
-            if self.logger:
-                self.logger.log_distraction(
-                    head_results['smoothed_yaw'],
-                    head_results['smoothed_pitch'],
-                    'warning'
-                )
-        
-        elif mouth_results['is_yawning']:
-            results['alert_level'] = 1
-            if self.audio_alert and self._should_alert('yawn'):
-                self.audio_alert.alert_yawn()
-            if self.logger:
-                self.logger.log_yawn(
-                    mouth_results['smoothed_mar'],
-                    int(mouth_results['yawn_duration'] * 1000)
-                )
-        
-        # Draw face bounding box
-        frame = self.visual_alert.draw_face_indicator(frame, True, face_data.bbox)
-        
-        return frame, results
-    
-    def run(self):
-        """Run the main detection loop."""
-        # Open video source
-        if isinstance(self.video_source, str):
-            self.cap = cv2.VideoCapture(self.video_source)
-        else:
-            self.cap = cv2.VideoCapture(self.video_source)
-            self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAMERA_CONFIG.FRAME_WIDTH)
-            self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_CONFIG.FRAME_HEIGHT)
-        
-        if not self.cap.isOpened():
-            print(f"Error: Could not open video source: {self.video_source}")
-            return
-        
-        # Get video properties for recording
-        frame_width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        frame_height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        fps = int(self.cap.get(cv2.CAP_PROP_FPS)) or 30
-        
-        # Initialize video writer
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        output_path = os.path.join(self.output_dir, f"dms_session_{timestamp}.mp4")
-        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-        self.video_writer = cv2.VideoWriter(output_path, fourcc, fps, (frame_width, frame_height))
-        
-        print("\n" + "="*50)
-        print("Driver Monitoring System - Running")
-        print("="*50)
-        print(f"Recording to: {output_path}")
-        print("Press 'q' to quit")
-        print("Press 'd' to toggle debug mode")
-        print("Press 'r' to reset counters")
-        print("="*50 + "\n")
-        
-        prev_time = time.time()
-        
-        try:
-            while True:
-                ret, frame = self.cap.read()
-                if not ret:
-                    # End of video file or camera error
-                    if isinstance(self.video_source, str):
-                        print("End of video file.")
-                        break
-                    else:
-                        print("Error reading from camera.")
-                        break
-                
-                # Calculate FPS
-                current_time = time.time()
-                frame_time = current_time - prev_time
-                prev_time = current_time
-                fps = self._calculate_fps(frame_time)
-                
-                # Update logger frame count
-                if self.logger:
-                    self.logger.update_frame_count()
-                
-                # Process frame
-                processed_frame, results = self.process_frame(frame)
-                
-                # Create dashboard overlay
-                processed_frame = create_dashboard_overlay(
-                    processed_frame,
-                    results['eye'],
-                    results['mouth'],
-                    results['head'],
-                    fps
-                )
-                
-                # Write frame to video
-                if self.video_writer:
-                    self.video_writer.write(processed_frame)
-                
-                # Display
-                cv2.imshow('Driver Monitoring System', processed_frame)
-                
-                # Handle key presses
-                key = cv2.waitKey(1) & 0xFF
-                
-                if key == ord('q'):
-                    print("Quit requested.")
-                    break
-                elif key == ord('d'):
-                    self.debug_mode = not self.debug_mode
-                    print(f"Debug mode: {'ON' if self.debug_mode else 'OFF'}")
-                elif key == ord('r'):
-                    self.eye_tracker.reset_blink_counter()
-                    self.mouth_tracker.reset_yawn_counter()
-                    print("Counters reset.")
-        
-        except KeyboardInterrupt:
-            print("\nInterrupted by user.")
-        
-        finally:
-            self.cleanup()
-    
-    def cleanup(self):
-        """Clean up resources."""
-        print("\nCleaning up...")
-        
-        if self.cap:
-            self.cap.release()
-        
-        if self.video_writer:
-            self.video_writer.release()
-            print(f"Video saved to: {self.output_dir}/")
-        
-        cv2.destroyAllWindows()
-        
-        if self.face_detector:
-            self.face_detector.close()
-        
-        if self.audio_alert:
-            self.audio_alert.close()
-        
-        if self.logger:
-            summary = self.logger.close()
-            print("\n" + "="*50)
-            print("Session Summary")
-            print("="*50)
-            print(f"Duration: {summary['duration_seconds']:.1f}s")
-            print(f"Total frames: {summary['total_frames']}")
-            print(f"Drowsiness events: {summary['drowsy_frames']}")
-            print(f"Yawn count: {summary['yawn_count']}")
-            print(f"Distraction events: {summary['distraction_count']}")
-            print("="*50)
-        
-        print("Cleanup complete.")
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAMERA_CONFIG.FRAME_WIDTH)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_CONFIG.FRAME_HEIGHT)
+    return cap, False
 
 
-def main():
-    """Main entry point."""
-    parser = argparse.ArgumentParser(
-        description='Driver Monitoring System - Real-time fatigue detection'
-    )
-    parser.add_argument(
-        '--video', '-v',
-        type=str,
-        default=None,
-        help='Path to video file (default: use webcam)'
-    )
-    parser.add_argument(
-        '--camera', '-c',
-        type=int,
-        default=0,
-        help='Camera index (default: 0)'
-    )
-    parser.add_argument(
-        '--no-audio',
-        action='store_true',
-        help='Disable audio alerts'
-    )
-    parser.add_argument(
-        '--no-log',
-        action='store_true',
-        help='Disable event logging'
-    )
-    parser.add_argument(
-        '--debug', '-d',
-        action='store_true',
-        help='Enable debug visualization'
-    )
-    
-    args = parser.parse_args()
-    
-    # Determine video source
-    video_source = args.video if args.video else args.camera
-    
-    # Create and run DMS
-    dms = DriverMonitoringSystem(
-        video_source=video_source,
-        enable_audio=not args.no_audio,
-        enable_logging=not args.no_log,
-        debug_mode=args.debug
-    )
-    
-    dms.run()
+def run(args) -> int:
+    cap, is_file = open_source(args)
+    src_fps = cap.get(cv2.CAP_PROP_FPS)
+    if args.fps:
+        src_fps = args.fps  # container metadata can be wrong (e.g. webcam recordings)
+    elif not src_fps or src_fps != src_fps or src_fps < 1:
+        src_fps = 30.0
+
+    try:
+        detector = FaceDetector(detection_confidence=CAMERA_CONFIG.DETECTION_CONFIDENCE,
+                                tracking_confidence=CAMERA_CONFIG.TRACKING_CONFIDENCE)
+    except ModelUnavailableError as exc:
+        cap.release()
+        sys.exit(f"Error: {exc}")
+
+    audio = None
+    if not args.no_audio and not args.headless:
+        audio = AudioAlert(enable_voice=not args.no_voice)
+        print(f"Audio backend: {audio.backend}")
+    logger = DMSLogger(console=not args.headless) if not args.no_log else None
+    pipeline = DMSPipeline(detector=detector, audio=audio, logger=logger)
+
+    show = not args.headless
+    writer: Optional[cv2.VideoWriter] = None
+    save_path = None
+    if args.save is not None:
+        save_path = args.save or str(RECORDINGS_DIR / f"dms_{datetime.now():%Y%m%d_%H%M%S}.mp4")
+        os.makedirs(os.path.dirname(os.path.abspath(save_path)), exist_ok=True)
+
+    print("\n" + "=" * 50)
+    print("Driver Monitoring System - running")
+    print(f"Source: {args.video or f'camera {args.camera}'}"
+          f"{' (headless)' if args.headless else ''}")
+    if show:
+        print("Keys: q quit | d debug landmarks | r reset counters")
+    print("=" * 50)
+
+    debug = args.debug
+    smoothed_fps = 0.0
+    prev_wall = time.perf_counter()
+    start_wall = prev_wall
+    frame_idx = 0
+    exit_code = 0
+    try:
+        while True:
+            ok, frame = cap.read()
+            if not ok:
+                print("End of video." if is_file else "Error: camera stopped delivering frames.")
+                exit_code = 0 if is_file else 1
+                break
+            if args.max_frames and frame_idx >= args.max_frames:
+                break
+
+            # Video files use media time (frame_idx / fps) so processing speed is irrelevant
+            ts = frame_idx / src_fps if is_file else time.monotonic()
+            if args.calibrate and frame_idx == 0:
+                pipeline.start_calibration(args.calibrate, ts)
+                print(f"Calibrating for {args.calibrate:.0f}s - look at the road with eyes open...")
+
+            result = pipeline.process(frame, ts)
+            frame_idx += 1
+
+            now = time.perf_counter()
+            inst = 1.0 / max(now - prev_wall, 1e-3)
+            prev_wall = now
+            smoothed_fps = inst if smoothed_fps == 0 else 0.9 * smoothed_fps + 0.1 * inst
+
+            if show or save_path:
+                out = annotate(frame, result, smoothed_fps, debug, args.privacy)
+                if save_path and writer is None:
+                    h, w = out.shape[:2]
+                    writer = cv2.VideoWriter(save_path, cv2.VideoWriter_fourcc(*'mp4v'), src_fps, (w, h))
+                    if not writer.isOpened():
+                        print(f"Warning: could not open {save_path} for writing; not saving.")
+                        save_path, writer = None, None
+                if writer:
+                    writer.write(out)
+                if show:
+                    try:
+                        cv2.imshow('Driver Monitoring System', out)
+                        key = cv2.waitKey(1) & 0xFF
+                    except cv2.error:
+                        print("Warning: no display available (OpenCV GUI failed); continuing headless.")
+                        show = False
+                        key = 255
+                    if key == ord('q'):
+                        print("Quit requested.")
+                        break
+                    elif key == ord('d'):
+                        debug = not debug
+                    elif key == ord('r'):
+                        pipeline.eye.reset_blink_counter()
+                        pipeline.mouth.reset_yawn_counter()
+                        print("Counters reset.")
+            if args.headless and frame_idx % 500 == 0:
+                print(f"  ... {frame_idx} frames ({frame_idx / (time.perf_counter() - start_wall):.0f} fps)")
+    except KeyboardInterrupt:
+        print("\nInterrupted by user.")
+    finally:
+        wall = time.perf_counter() - start_wall
+        cap.release()
+        if writer:
+            writer.release()
+            print(f"Annotated video saved to: {save_path}")
+        if show:
+            cv2.destroyAllWindows()
+        detector.close()
+        if audio:
+            audio.close()
+        report = pipeline.report()
+        report['processing_fps'] = frame_idx / wall if wall > 0 else 0.0
+        report['source'] = args.video or f"camera:{args.camera}"
+        if logger:
+            if is_file:
+                logger.duration_override = report['media_seconds']
+            logger.close()
+        print_report(report)
+        if args.report:
+            os.makedirs(os.path.dirname(os.path.abspath(args.report)), exist_ok=True)
+            with open(args.report, 'w') as f:
+                json.dump(report, f, indent=2)
+            print(f"Report written to {args.report}")
+    return exit_code
+
+
+def print_report(r: dict):
+    print("\n" + "=" * 50)
+    print("Session summary")
+    print("=" * 50)
+    print(f"Frames: {r['frames']}  ({r['media_seconds']:.1f}s of media, {r['processing_fps']:.0f} fps processing)")
+    print(f"Face found in {r['face_fraction'] * 100:.1f}% of frames")
+    if r['ear']:
+        print(f"EAR  median {r['ear']['median']:.3f}  [p5 {r['ear']['p5']:.3f}, p95 {r['ear']['p95']:.3f}]"
+              f"   threshold {r['ear_threshold']:.3f}")
+        print(f"MAR  median {r['mar']['median']:.3f}  [p5 {r['mar']['p5']:.3f}, p95 {r['mar']['p95']:.3f}]"
+              f"   threshold {r['mar_threshold']:.2f}")
+    if r['calibration']:
+        print(f"Calibration: {r['calibration']}")
+    ep = r['episodes']
+    print(f"Blinks {r['blinks']} | drowsy episodes {ep['drowsy']} | yawns {ep['yawn']} | "
+          f"distraction episodes {ep['distracted']} | no-driver episodes {ep['no_face']}")
+    print("=" * 50)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(description='Driver Monitoring System - real-time fatigue detection')
+    p.add_argument('--video', '-v', default=None, help='analyse this video file instead of the webcam')
+    p.add_argument('--camera', '-c', type=int, default=0, help='camera index (default 0)')
+    p.add_argument('--headless', '--no-display', dest='headless', action='store_true',
+                   help='no window and no audio (for servers / batch analysis)')
+    p.add_argument('--save', nargs='?', const='', default=None, metavar='PATH',
+                   help='write the annotated video (default path: recordings/dms_<time>.mp4)')
+    p.add_argument('--privacy', action='store_true',
+                   help='in saved/displayed output replace the image with black and draw landmarks only')
+    p.add_argument('--report', metavar='PATH', help='write a JSON statistics report')
+    p.add_argument('--calibrate', type=float, default=0, metavar='SECONDS',
+                   help='personalise EAR threshold and neutral head pose from the first SECONDS')
+    p.add_argument('--fps', type=float, default=0,
+                   help='override the video frame rate used for timing (if file metadata is wrong)')
+    p.add_argument('--max-frames', type=int, default=0, help='stop after N frames')
+    p.add_argument('--no-audio', action='store_true', help='disable audio alerts')
+    p.add_argument('--no-voice', action='store_true', help='beeps only, no text-to-speech')
+    p.add_argument('--no-log', action='store_true', help='do not write session logs to logs/')
+    p.add_argument('--debug', '-d', action='store_true', help='draw landmarks and pose')
+    return p
+
+
+def main(argv=None) -> int:
+    return run(build_parser().parse_args(argv))
 
 
 if __name__ == '__main__':
-    main()
+    sys.exit(main())

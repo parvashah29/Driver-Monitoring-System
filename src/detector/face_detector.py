@@ -11,22 +11,59 @@ from mediapipe.tasks.python import vision
 from typing import Optional, Tuple, List
 from dataclasses import dataclass
 import os
+import urllib.error
 import urllib.request
 
+from ..utils.config import MODELS_DIR
 
-# Model download URL
+
+# Official MediaPipe model storage
 MODEL_URL = "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task"
-MODEL_PATH = os.path.join(os.path.dirname(__file__), "..", "..", "models", "face_landmarker.task")
+MODEL_PATH = str(MODELS_DIR / "face_landmarker.task")
+# The float16 model is ~3.7 MB; anything far smaller is a truncated download
+_MIN_MODEL_BYTES = 1_000_000
 
 
-def download_model():
-    """Download the face landmarker model if not present."""
-    os.makedirs(os.path.dirname(MODEL_PATH), exist_ok=True)
-    if not os.path.exists(MODEL_PATH):
-        print(f"Downloading face landmarker model...")
-        urllib.request.urlretrieve(MODEL_URL, MODEL_PATH)
-        print(f"Model downloaded to {MODEL_PATH}")
-    return MODEL_PATH
+class ModelUnavailableError(RuntimeError):
+    """Raised when the face landmarker model is missing and cannot be downloaded."""
+
+
+def download_model(path: str = MODEL_PATH, url: str = MODEL_URL, timeout: float = 30.0) -> str:
+    """
+    Return the path to the face landmarker model, downloading it on first use.
+
+    The file is written atomically (temp file + rename) so an interrupted
+    download can never leave a corrupt model behind.
+
+    Raises:
+        ModelUnavailableError: if the model is absent and the download fails.
+    """
+    if os.path.exists(path) and os.path.getsize(path) >= _MIN_MODEL_BYTES:
+        return path
+
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp_path = path + ".part"
+    print(f"Face landmarker model not found - downloading to {path} ...")
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as resp, open(tmp_path, "wb") as out:
+            while True:
+                chunk = resp.read(1 << 16)
+                if not chunk:
+                    break
+                out.write(chunk)
+        if os.path.getsize(tmp_path) < _MIN_MODEL_BYTES:
+            raise ModelUnavailableError("downloaded model file is incomplete")
+        os.replace(tmp_path, path)
+    except (urllib.error.URLError, OSError, TimeoutError, ModelUnavailableError) as exc:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+        raise ModelUnavailableError(
+            f"Could not download the face landmarker model ({exc}).\n"
+            f"Check your internet connection, or download it manually from\n  {url}\n"
+            f"and save it as {path}"
+        ) from exc
+    print("Model downloaded.")
+    return path
 
 
 @dataclass
@@ -43,8 +80,13 @@ class FaceData:
         lm = self.landmarks[idx]
         return int(lm[0] * self.image_width), int(lm[1] * self.image_height)
     
+    def get_landmarks_float(self, indices: Tuple[int, ...]) -> np.ndarray:
+        """Sub-pixel (x, y) pixel coordinates for multiple landmarks, shape (n, 2)."""
+        pts = self.landmarks[list(indices), :2]
+        return pts * np.array([self.image_width, self.image_height], dtype=np.float64)
+
     def get_landmarks(self, indices: Tuple[int, ...]) -> np.ndarray:
-        """Get pixel coordinates for multiple landmarks"""
+        """Get integer pixel coordinates for multiple landmarks (for drawing)"""
         coords = []
         for idx in indices:
             lm = self.landmarks[idx]
@@ -152,8 +194,8 @@ class FaceDetector:
             image_height=h
         )
     
+    @staticmethod
     def draw_landmarks(
-        self,
         frame: np.ndarray,
         face_data: FaceData,
         draw_mesh: bool = False,

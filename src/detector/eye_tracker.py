@@ -3,172 +3,150 @@ Eye Tracking Module for Drowsiness Detection
 Calculates Eye Aspect Ratio (EAR) for blink and drowsiness detection.
 """
 
-import numpy as np
-from typing import Tuple, Optional
-from scipy.spatial import distance
-import sys
-import os
+import time
+from collections import deque
+from typing import Optional, Sequence, Tuple
 
-# Add parent directory to path for imports
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from utils.config import EYE_CONFIG
+import numpy as np
+
+from ..utils.config import EYE_CONFIG
 
 
 class EyeTracker:
     """
     Eye tracking using Eye Aspect Ratio (EAR) calculation.
-    
+
     EAR = (|P2-P6| + |P3-P5|) / (2 * |P1-P4|)
-    
+
     Where P1-P6 are the 6 eye landmark points:
-        P1: Left corner
-        P2: Upper left
-        P3: Upper right
-        P4: Right corner
-        P5: Lower right
-        P6: Lower left
+        P1: outer corner, P2/P3: upper lid, P4: inner corner, P5/P6: lower lid
+
+    Drowsiness is time based (eyes closed for `closed_seconds`), so behaviour
+    does not depend on the camera frame rate. Every `update` accepts an explicit
+    timestamp so video files can be processed faster than real time.
     """
-    
+
+    # A closure must span at least this many frames to count as a blink
+    MIN_BLINK_FRAMES = 2
+
     def __init__(
         self,
-        ear_threshold: float = None,
-        consecutive_frames: int = None
+        ear_threshold: Optional[float] = None,
+        closed_seconds: Optional[float] = None,
+        history_size: int = 5,
     ):
-        """
-        Initialize eye tracker.
-        
-        Args:
-            ear_threshold: EAR value below which eye is considered closed
-            consecutive_frames: Frames with closed eyes to trigger drowsiness
-        """
-        self.ear_threshold = ear_threshold or EYE_CONFIG.EAR_THRESHOLD
-        self.consecutive_frames = consecutive_frames or EYE_CONFIG.CONSECUTIVE_FRAMES
-        
-        # MediaPipe Face Mesh eye landmark indices
+        self.ear_threshold = EYE_CONFIG.EAR_THRESHOLD if ear_threshold is None else ear_threshold
+        self.closed_seconds = EYE_CONFIG.CLOSED_SECONDS if closed_seconds is None else closed_seconds
+
         self.left_eye_indices = EYE_CONFIG.LEFT_EYE_INDICES
         self.right_eye_indices = EYE_CONFIG.RIGHT_EYE_INDICES
-        
-        # State tracking
+
+        # State
         self.closed_frame_counter = 0
+        self.closed_since: Optional[float] = None
+        self.closed_duration = 0.0
         self.blink_counter = 0
         self.is_drowsy = False
-        
-        # History for smoothing
-        self.ear_history = []
-        self.history_size = 5
-    
-    def calculate_ear(self, eye_points: np.ndarray) -> float:
+        self.baseline_ear: Optional[float] = None
+
+        self.ear_history = deque(maxlen=history_size)
+
+    @staticmethod
+    def calculate_ear(eye_points: np.ndarray) -> float:
         """
-        Calculate Eye Aspect Ratio for a single eye.
-        
+        Eye Aspect Ratio for one eye.
+
         Args:
-            eye_points: Array of 6 (x, y) coordinates for eye landmarks
-            
-        Returns:
-            EAR value (typically 0.15-0.45 for open eyes)
+            eye_points: 6 (x, y) points ordered P1..P6 as described above
         """
-        # Compute euclidean distances between vertical eye landmarks
-        # P2-P6 (upper-left to lower-left)
-        vertical_1 = distance.euclidean(eye_points[1], eye_points[5])
-        # P3-P5 (upper-right to lower-right)
-        vertical_2 = distance.euclidean(eye_points[2], eye_points[4])
-        
-        # Compute euclidean distance between horizontal eye landmarks
-        # P1-P4 (left corner to right corner)
-        horizontal = distance.euclidean(eye_points[0], eye_points[3])
-        
-        # Avoid division by zero
+        pts = np.asarray(eye_points, dtype=np.float64)
+        vertical_1 = np.linalg.norm(pts[1] - pts[5])
+        vertical_2 = np.linalg.norm(pts[2] - pts[4])
+        horizontal = np.linalg.norm(pts[0] - pts[3])
         if horizontal == 0:
             return 0.0
-        
-        # Calculate EAR
-        ear = (vertical_1 + vertical_2) / (2.0 * horizontal)
-        return ear
-    
+        return float((vertical_1 + vertical_2) / (2.0 * horizontal))
+
     def get_ear(self, face_data) -> Tuple[float, float, float]:
-        """
-        Calculate EAR for both eyes from face data.
-        
-        Args:
-            face_data: FaceData object with landmarks
-            
-        Returns:
-            Tuple of (left_ear, right_ear, average_ear)
-        """
-        # Get eye landmark coordinates
-        left_eye = face_data.get_landmarks(self.left_eye_indices)
-        right_eye = face_data.get_landmarks(self.right_eye_indices)
-        
-        # Calculate EAR for each eye
-        left_ear = self.calculate_ear(left_eye)
-        right_ear = self.calculate_ear(right_eye)
-        
-        # Average EAR
-        avg_ear = (left_ear + right_ear) / 2.0
-        
-        return left_ear, right_ear, avg_ear
-    
+        """Return (left_ear, right_ear, average_ear) for a FaceData."""
+        left_ear = self.calculate_ear(face_data.get_landmarks_float(self.left_eye_indices))
+        right_ear = self.calculate_ear(face_data.get_landmarks_float(self.right_eye_indices))
+        return left_ear, right_ear, (left_ear + right_ear) / 2.0
+
     def get_smoothed_ear(self, current_ear: float) -> float:
-        """
-        Get temporally smoothed EAR value.
-        
-        Args:
-            current_ear: Current frame's EAR value
-            
-        Returns:
-            Smoothed EAR value
-        """
+        """Moving average over the last few frames."""
         self.ear_history.append(current_ear)
-        if len(self.ear_history) > self.history_size:
-            self.ear_history.pop(0)
-        
-        return np.mean(self.ear_history)
-    
-    def update(self, face_data) -> dict:
+        return float(np.mean(self.ear_history))
+
+    def calibrate(self, open_eye_ears: Sequence[float]) -> float:
         """
-        Update eye tracking state with new frame data.
-        
-        Args:
-            face_data: FaceData object with landmarks
-            
-        Returns:
-            Dictionary with tracking results
+        Personalise the closed-eye threshold from EAR samples taken while the
+        driver looks at the camera with eyes open (blinks are rejected by using
+        the upper-middle percentile). Returns the new threshold.
         """
+        values = np.asarray(list(open_eye_ears), dtype=np.float64)
+        if values.size < 10:
+            raise ValueError("need at least 10 EAR samples to calibrate")
+        self.baseline_ear = float(np.percentile(values, 60))
+        # Never stray far from the sane absolute range
+        self.ear_threshold = float(np.clip(EYE_CONFIG.CALIBRATION_RATIO * self.baseline_ear, 0.12, 0.30))
+        return self.ear_threshold
+
+    def update(self, face_data, timestamp: Optional[float] = None) -> dict:
+        """Update state with one frame's landmarks (timestamp in seconds)."""
+        if timestamp is None:
+            timestamp = time.time()
         left_ear, right_ear, avg_ear = self.get_ear(face_data)
+        return self.update_ear(avg_ear, timestamp, left_ear, right_ear)
+
+    def update_ear(
+        self,
+        avg_ear: float,
+        timestamp: float,
+        left_ear: Optional[float] = None,
+        right_ear: Optional[float] = None,
+    ) -> dict:
+        """State machine core, driven directly by an EAR value (used by tests)."""
         smoothed_ear = self.get_smoothed_ear(avg_ear)
-        
-        # Check if eyes are closed
         eyes_closed = smoothed_ear < self.ear_threshold
-        
+
         if eyes_closed:
+            if self.closed_since is None:
+                self.closed_since = timestamp
             self.closed_frame_counter += 1
+            self.closed_duration = timestamp - self.closed_since
         else:
-            # Check for blink (short closure)
-            if 2 <= self.closed_frame_counter < self.consecutive_frames:
+            # A short closure that ended is a blink
+            if (self.MIN_BLINK_FRAMES <= self.closed_frame_counter
+                    and self.closed_duration < self.closed_seconds):
                 self.blink_counter += 1
+            self.closed_since = None
             self.closed_frame_counter = 0
-        
-        # Check for drowsiness
-        self.is_drowsy = self.closed_frame_counter >= self.consecutive_frames
-        
+            self.closed_duration = 0.0
+
+        self.is_drowsy = eyes_closed and self.closed_duration >= self.closed_seconds
+
         return {
-            'left_ear': left_ear,
-            'right_ear': right_ear,
+            'left_ear': avg_ear if left_ear is None else left_ear,
+            'right_ear': avg_ear if right_ear is None else right_ear,
             'avg_ear': avg_ear,
             'smoothed_ear': smoothed_ear,
             'eyes_closed': eyes_closed,
             'is_drowsy': self.is_drowsy,
             'closed_frames': self.closed_frame_counter,
+            'closed_duration': self.closed_duration,
             'blink_count': self.blink_counter,
-            'drowsiness_progress': min(self.closed_frame_counter / self.consecutive_frames, 1.0)
+            'drowsiness_progress': min(self.closed_duration / self.closed_seconds, 1.0),
         }
-    
+
     def reset(self):
-        """Reset tracking state"""
+        """Reset tracking state (e.g. when the face is lost). Keeps blink count."""
         self.closed_frame_counter = 0
+        self.closed_since = None
+        self.closed_duration = 0.0
         self.is_drowsy = False
         self.ear_history.clear()
-    
+
     def reset_blink_counter(self):
         """Reset blink counter (e.g., for per-minute statistics)"""
         self.blink_counter = 0

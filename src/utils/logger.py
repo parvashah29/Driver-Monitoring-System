@@ -7,16 +7,19 @@ import json
 import logging
 from datetime import datetime
 from pathlib import Path
+import sys
 from typing import Dict, Any, Optional, List
 from dataclasses import dataclass, asdict
 import csv
+
+from .config import LOGS_DIR
 
 
 @dataclass
 class FatigueEvent:
     """Represents a single fatigue detection event"""
     timestamp: str
-    event_type: str  # 'drowsiness', 'yawn', 'distraction'
+    event_type: str  # 'drowsiness', 'yawn', 'distraction', 'no_face'
     severity: str    # 'warning', 'critical'
     ear_value: Optional[float] = None
     mar_value: Optional[float] = None
@@ -28,9 +31,13 @@ class FatigueEvent:
 class DMSLogger:
     """Logger for Driver Monitoring System events"""
     
-    def __init__(self, log_dir: str = "logs", session_id: Optional[str] = None):
-        self.log_dir = Path(log_dir)
-        self.log_dir.mkdir(exist_ok=True)
+    def __init__(self, log_dir=None, session_id: Optional[str] = None, console: bool = True):
+        # Default: <project>/logs (git-ignored), independent of the working directory
+        self.log_dir = Path(log_dir) if log_dir else LOGS_DIR
+        self.log_dir.mkdir(parents=True, exist_ok=True)
+        self._console = console
+        # Set to the media length (s) when processing a video file faster than real time
+        self.duration_override: Optional[float] = None
         
         # Create session ID
         self.session_id = session_id or datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -42,7 +49,9 @@ class DMSLogger:
         # Session statistics
         self.stats = {
             'total_frames': 0,
-            'drowsy_frames': 0,
+            'drowsy_frames': 0,   # frames spent in the drowsy state
+            'drowsy_count': 0,    # distinct drowsiness events
+            'no_face_count': 0,
             'yawn_count': 0,
             'distraction_count': 0,
             'warning_alerts': 0,
@@ -53,27 +62,31 @@ class DMSLogger:
         self._setup_logging()
     
     def _setup_logging(self):
-        """Configure Python logging"""
+        """Per-session logger writing to logs/dms_session_<id>.log (and the console)."""
         log_file = self.log_dir / f"dms_session_{self.session_id}.log"
-        
-        logging.basicConfig(
-            level=logging.INFO,
-            format='%(asctime)s | %(levelname)s | %(message)s',
-            handlers=[
-                logging.FileHandler(log_file),
-                logging.StreamHandler()
-            ]
-        )
-        self.logger = logging.getLogger(__name__)
+        # Dedicated, non-propagating logger so sessions don't pollute (or depend on)
+        # the root logger configuration.
+        self.logger = logging.getLogger(f"dms.session.{self.session_id}")
+        self.logger.setLevel(logging.INFO)
+        self.logger.propagate = False
+        fmt = logging.Formatter('%(asctime)s | %(levelname)s | %(message)s')
+        self._handlers = [logging.FileHandler(log_file)]
+        if self._console:
+            self._handlers.append(logging.StreamHandler(sys.stdout))
+        for h in self._handlers:
+            h.setFormatter(fmt)
+            self.logger.addHandler(h)
         self.logger.info(f"DMS Session started: {self.session_id}")
-    
+
     def log_event(self, event: FatigueEvent):
         """Log a fatigue event"""
         self.events.append(event)
         
         # Update statistics
         if event.event_type == 'drowsiness':
-            self.stats['drowsy_frames'] += 1
+            self.stats['drowsy_count'] += 1
+        elif event.event_type == 'no_face':
+            self.stats['no_face_count'] += 1
         elif event.event_type == 'yawn':
             self.stats['yawn_count'] += 1
         elif event.event_type == 'distraction':
@@ -89,7 +102,8 @@ class DMSLogger:
         mar_str = f"{event.mar_value:.3f}" if event.mar_value is not None else "N/A"
         self.logger.warning(
             f"{event.event_type.upper()} [{event.severity}] - "
-            f"EAR: {ear_str}, MAR: {mar_str}"
+            f"EAR: {ear_str}, MAR: {mar_str}, "
+            f"yaw: {event.head_yaw if event.head_yaw is not None else 'N/A'}"
         )
     
     def log_drowsiness(self, ear_value: float, severity: str = 'warning'):
@@ -124,13 +138,25 @@ class DMSLogger:
         )
         self.log_event(event)
     
-    def update_frame_count(self, count: int = 1):
-        """Update total frame count"""
+    def log_no_face(self, duration_ms: int):
+        """Log a 'driver not detected' event"""
+        self.log_event(FatigueEvent(
+            timestamp=datetime.now().isoformat(),
+            event_type='no_face',
+            severity='warning',
+            duration_ms=duration_ms,
+        ))
+
+    def update_frame_count(self, count: int = 1, drowsy: bool = False):
+        """Update total frame count (and the drowsy-frame count if `drowsy`)"""
         self.stats['total_frames'] += count
+        if drowsy:
+            self.stats['drowsy_frames'] += count
     
     def get_session_summary(self) -> Dict[str, Any]:
         """Get session summary statistics"""
-        session_duration = (datetime.now() - self.session_start).total_seconds()
+        session_duration = self.duration_override if self.duration_override is not None else (
+            datetime.now() - self.session_start).total_seconds()
         
         return {
             'session_id': self.session_id,
@@ -171,4 +197,7 @@ class DMSLogger:
         self.save_session()
         summary = self.get_session_summary()
         self.logger.info(f"Session ended. Total events: {summary['total_events']}")
+        for h in self._handlers:
+            self.logger.removeHandler(h)
+            h.close()
         return summary

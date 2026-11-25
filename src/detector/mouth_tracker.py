@@ -3,148 +3,90 @@ Mouth Tracking Module for Yawn Detection
 Calculates Mouth Aspect Ratio (MAR) for yawn detection.
 """
 
-import numpy as np
-from typing import Tuple, Optional
-from scipy.spatial import distance
 import time
-import sys
-import os
+from collections import deque
+from typing import Optional, Tuple
 
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from utils.config import MOUTH_CONFIG
+import numpy as np
+
+from ..utils.config import MOUTH_CONFIG
 
 
 class MouthTracker:
     """
-    Mouth tracking using Mouth Aspect Ratio (MAR) calculation.
-    
-    MAR = vertical_distance / horizontal_distance
-    
-    Higher MAR indicates more open mouth (yawning).
+    Mouth tracking using Mouth Aspect Ratio (MAR).
+
+    MAR = mean(inner-lip openings) / mouth width. A yawn is a MAR above the
+    threshold that is sustained for `yawn_duration` seconds (talking and
+    smiling do not last that long at high MAR).
     """
-    
-    # MediaPipe Face Mesh mouth landmark indices
-    # Outer lips: 61, 146, 91, 181, 84, 17, 314, 405, 321, 375, 291, 409, 270, 269, 267, 0, 37, 39, 40, 185
-    # Key points for MAR calculation
-    UPPER_LIP_TOP = 13      # Top of upper lip
-    LOWER_LIP_BOTTOM = 14   # Bottom of lower lip
-    LEFT_CORNER = 61        # Left corner of mouth
-    RIGHT_CORNER = 291      # Right corner of mouth
-    
-    # Additional points for better MAR calculation
-    UPPER_INNER = 82        # Inner upper lip
-    LOWER_INNER = 87        # Inner lower lip
-    
+
+    # MediaPipe Face Mesh landmark indices
+    UPPER_LIP_TOP = 13      # Inner upper lip (centre)
+    LOWER_LIP_BOTTOM = 14   # Inner lower lip (centre)
+    LEFT_CORNER = 61        # Mouth corner
+    RIGHT_CORNER = 291      # Mouth corner
+    UPPER_INNER = 82        # Inner upper lip (off-centre)
+    LOWER_INNER = 87        # Inner lower lip (off-centre)
+
     def __init__(
         self,
-        mar_threshold: float = None,
-        yawn_duration: float = None
+        mar_threshold: Optional[float] = None,
+        yawn_duration: Optional[float] = None,
+        history_size: int = 5,
     ):
-        """
-        Initialize mouth tracker.
-        
-        Args:
-            mar_threshold: MAR value above which mouth is considered yawning
-            yawn_duration: Duration in seconds mouth must be open to count as yawn
-        """
-        self.mar_threshold = mar_threshold or MOUTH_CONFIG.MAR_THRESHOLD
-        self.yawn_duration = yawn_duration or MOUTH_CONFIG.YAWN_DURATION
-        
-        # State tracking
-        self.yawn_start_time = None
+        self.mar_threshold = MOUTH_CONFIG.MAR_THRESHOLD if mar_threshold is None else mar_threshold
+        self.yawn_duration = MOUTH_CONFIG.YAWN_DURATION if yawn_duration is None else yawn_duration
+
+        self.yawn_start_time: Optional[float] = None
         self.is_yawning = False
         self.yawn_counter = 0
         self.current_yawn_duration = 0.0
-        
-        # History for smoothing
-        self.mar_history = []
-        self.history_size = 5
-    
+
+        self.mar_history = deque(maxlen=history_size)
+
     def calculate_mar(self, face_data) -> float:
-        """
-        Calculate Mouth Aspect Ratio.
-        
-        Args:
-            face_data: FaceData object with landmarks
-            
-        Returns:
-            MAR value (0.0-1.0+, higher = more open)
-        """
-        # Get key mouth landmark coordinates
-        upper = face_data.get_landmark(self.UPPER_LIP_TOP)
-        lower = face_data.get_landmark(self.LOWER_LIP_BOTTOM)
-        left = face_data.get_landmark(self.LEFT_CORNER)
-        right = face_data.get_landmark(self.RIGHT_CORNER)
-        
-        # Additional points for more accurate measurement
-        upper_inner = face_data.get_landmark(self.UPPER_INNER)
-        lower_inner = face_data.get_landmark(self.LOWER_INNER)
-        
-        # Calculate vertical distances
-        vertical_1 = distance.euclidean(upper, lower)
-        vertical_2 = distance.euclidean(upper_inner, lower_inner)
-        avg_vertical = (vertical_1 + vertical_2) / 2
-        
-        # Calculate horizontal distance
-        horizontal = distance.euclidean(left, right)
-        
-        # Avoid division by zero
+        """Mouth Aspect Ratio for a FaceData (0 = closed, ~0.6+ = wide open)."""
+        pts = face_data.get_landmarks_float((
+            self.UPPER_LIP_TOP, self.LOWER_LIP_BOTTOM,
+            self.LEFT_CORNER, self.RIGHT_CORNER,
+            self.UPPER_INNER, self.LOWER_INNER,
+        ))
+        vertical_1 = np.linalg.norm(pts[0] - pts[1])
+        vertical_2 = np.linalg.norm(pts[4] - pts[5])
+        horizontal = np.linalg.norm(pts[2] - pts[3])
         if horizontal == 0:
             return 0.0
-        
-        # Calculate MAR
-        mar = avg_vertical / horizontal
-        return mar
-    
+        return float((vertical_1 + vertical_2) / 2.0 / horizontal)
+
     def get_smoothed_mar(self, current_mar: float) -> float:
-        """
-        Get temporally smoothed MAR value.
-        
-        Args:
-            current_mar: Current frame's MAR value
-            
-        Returns:
-            Smoothed MAR value
-        """
+        """Moving average over the last few frames."""
         self.mar_history.append(current_mar)
-        if len(self.mar_history) > self.history_size:
-            self.mar_history.pop(0)
-        
-        return np.mean(self.mar_history)
-    
-    def update(self, face_data) -> dict:
-        """
-        Update mouth tracking state with new frame data.
-        
-        Args:
-            face_data: FaceData object with landmarks
-            
-        Returns:
-            Dictionary with tracking results
-        """
-        mar = self.calculate_mar(face_data)
+        return float(np.mean(self.mar_history))
+
+    def update(self, face_data, timestamp: Optional[float] = None) -> dict:
+        """Update state with one frame's landmarks (timestamp in seconds)."""
+        if timestamp is None:
+            timestamp = time.time()
+        return self.update_mar(self.calculate_mar(face_data), timestamp)
+
+    def update_mar(self, mar: float, timestamp: float) -> dict:
+        """State machine core, driven directly by a MAR value (used by tests)."""
         smoothed_mar = self.get_smoothed_mar(mar)
-        current_time = time.time()
-        
-        # Check if mouth is open wide enough to be yawning
         mouth_open = smoothed_mar > self.mar_threshold
-        
+
         if mouth_open:
             if self.yawn_start_time is None:
-                self.yawn_start_time = current_time
-            
-            self.current_yawn_duration = current_time - self.yawn_start_time
-            
-            # Check if yawn duration threshold exceeded
-            if self.current_yawn_duration >= self.yawn_duration:
-                if not self.is_yawning:
-                    self.yawn_counter += 1
-                    self.is_yawning = True
+                self.yawn_start_time = timestamp
+            self.current_yawn_duration = timestamp - self.yawn_start_time
+            if self.current_yawn_duration >= self.yawn_duration and not self.is_yawning:
+                self.yawn_counter += 1
+                self.is_yawning = True
         else:
             self.yawn_start_time = None
             self.current_yawn_duration = 0.0
             self.is_yawning = False
-        
+
         return {
             'mar': mar,
             'smoothed_mar': smoothed_mar,
@@ -152,16 +94,16 @@ class MouthTracker:
             'is_yawning': self.is_yawning,
             'yawn_duration': self.current_yawn_duration,
             'yawn_count': self.yawn_counter,
-            'yawn_progress': min(self.current_yawn_duration / self.yawn_duration, 1.0) if mouth_open else 0.0
+            'yawn_progress': min(self.current_yawn_duration / self.yawn_duration, 1.0) if mouth_open else 0.0,
         }
-    
+
     def reset(self):
-        """Reset tracking state"""
+        """Reset tracking state (e.g. when the face is lost). Keeps yawn count."""
         self.yawn_start_time = None
         self.is_yawning = False
         self.current_yawn_duration = 0.0
         self.mar_history.clear()
-    
+
     def reset_yawn_counter(self):
         """Reset yawn counter (e.g., for per-session statistics)"""
         self.yawn_counter = 0

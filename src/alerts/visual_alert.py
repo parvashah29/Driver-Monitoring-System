@@ -7,11 +7,8 @@ import cv2
 import numpy as np
 from typing import Tuple, Dict, Any, Optional
 import time
-import sys
-import os
 
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from utils.config import ALERT_CONFIG
+from ..utils.config import ALERT_CONFIG
 
 
 class VisualAlert:
@@ -70,15 +67,15 @@ class VisualAlert:
         if 'mar' in status:
             lines.append(f"MAR: {status['mar']:.3f}")
         if 'yaw' in status:
-            lines.append(f"Yaw: {status['yaw']:.1f}°")
+            lines.append(f"Yaw: {status['yaw']:.1f}deg")
         if 'pitch' in status:
-            lines.append(f"Pitch: {status['pitch']:.1f}°")
+            lines.append(f"Pitch: {status['pitch']:.1f}deg")
         if 'fps' in status:
             lines.append(f"FPS: {status['fps']:.1f}")
         if 'state' in status:
             lines.append(f"State: {status['state']}")
         
-        panel_width = 150
+        panel_width = 200
         panel_height = len(lines) * line_height + 2 * padding
         
         # Draw semi-transparent background
@@ -257,7 +254,7 @@ class VisualAlert:
                 cv2.rectangle(overlay, (0, 0), (w, h), (0, 0, 200), -1)
                 cv2.addWeighted(overlay, 0.3, frame, 0.7, 0, frame)
             
-            self.draw_alert_banner(frame, "⚠️ DROWSINESS DETECTED - WAKE UP!", 'critical')
+            self.draw_alert_banner(frame, "DROWSINESS DETECTED - WAKE UP!", 'critical')
         elif progress > 0.3:
             # Warning progress bar
             self.draw_progress_bar(
@@ -268,70 +265,77 @@ class VisualAlert:
         return frame
 
 
+_STATE_BANNERS = {
+    'DROWSY': ("DROWSINESS DETECTED - WAKE UP!", 'critical'),
+    'DISTRACTED': ("KEEP EYES ON ROAD!", 'warning'),
+    'YAWNING': ("Yawn detected - take a break", 'warning'),
+    'NO DRIVER': ("DRIVER NOT DETECTED", 'warning'),
+}
+
+_visual = None
+
+
 def create_dashboard_overlay(
     frame: np.ndarray,
     eye_data: Dict,
     mouth_data: Dict,
     head_data: Dict,
-    fps: float = 0.0
+    fps: float = 0.0,
+    state: Optional[str] = None,
+    footer: Optional[str] = None,
 ) -> np.ndarray:
     """
-    Create complete dashboard overlay on frame.
-    
+    Draw the complete HUD (status panel, progress bars, alert banner) on a frame.
+
     Args:
-        frame: BGR image
-        eye_data: Eye tracking results
-        mouth_data: Mouth tracking results
-        head_data: Head pose results
-        fps: Current FPS
-        
-    Returns:
-        Frame with complete overlay
+        eye_data / mouth_data / head_data: tracker results (empty dicts if no face)
+        fps: current processing FPS
+        state: pipeline state name (DROWSY, DISTRACTED, YAWNING, NO DRIVER,
+            NORMAL, CALIBRATING). Derived from the tracker data if omitted.
+        footer: optional text line along the bottom edge
     """
-    visual = VisualAlert()
+    global _visual
+    if _visual is None:
+        _visual = VisualAlert()  # shared so the banner flash timing persists
+    visual = _visual
     h, w = frame.shape[:2]
-    
-    # Determine overall state
-    if eye_data.get('is_drowsy'):
-        state = "DROWSY"
-        frame = visual.draw_alert_banner(frame, "⚠️ DROWSINESS DETECTED!", 'critical')
-    elif head_data.get('is_distracted'):
-        state = "DISTRACTED"
-        frame = visual.draw_alert_banner(frame, "⚠️ KEEP EYES ON ROAD!", 'warning')
-    elif mouth_data.get('is_yawning'):
-        state = "YAWNING"
-        frame = visual.draw_alert_banner(frame, "Yawn detected - Take a break", 'warning')
-    else:
-        state = "NORMAL"
-    
-    # Status panel
+
+    if state is None:
+        if eye_data.get('is_drowsy'):
+            state = 'DROWSY'
+        elif head_data.get('is_distracted'):
+            state = 'DISTRACTED'
+        elif mouth_data.get('is_yawning'):
+            state = 'YAWNING'
+        else:
+            state = 'NORMAL'
+
+    panel_y = 10
+    if state in _STATE_BANNERS:
+        message, severity = _STATE_BANNERS[state]
+        frame = visual.draw_alert_banner(frame, message, severity)
+        panel_y = 60
+
     status = {
         'ear': eye_data.get('smoothed_ear', 0),
         'mar': mouth_data.get('smoothed_mar', 0),
         'yaw': head_data.get('smoothed_yaw', 0),
         'pitch': head_data.get('smoothed_pitch', 0),
         'fps': fps,
-        'state': state
+        'state': state,
     }
-    frame = visual.draw_status_panel(frame, status)
-    
-    # Progress bars
-    if eye_data.get('drowsiness_progress', 0) > 0:
-        frame = visual.draw_progress_bar(
-            frame, eye_data['drowsiness_progress'], "Drowsiness",
-            (w - 220, 60), (200, 15)
-        )
-    
-    if mouth_data.get('yawn_progress', 0) > 0:
-        frame = visual.draw_progress_bar(
-            frame, mouth_data['yawn_progress'], "Yawn",
-            (w - 220, 90), (200, 15)
-        )
-    
-    if head_data.get('distraction_progress', 0) > 0:
-        frame = visual.draw_progress_bar(
-            frame, head_data['distraction_progress'], "Distraction",
-            (w - 220, 120), (200, 15)
-        )
-    
+    frame = visual.draw_status_panel(frame, status, position=(10, panel_y))
+
+    for i, (data, key, label) in enumerate((
+        (eye_data, 'drowsiness_progress', "Drowsiness"),
+        (mouth_data, 'yawn_progress', "Yawn"),
+        (head_data, 'distraction_progress', "Distraction"),
+    )):
+        if data.get(key, 0) > 0:
+            frame = visual.draw_progress_bar(
+                frame, data[key], label, (w - 220, 90 + i * 30), (200, 15))
+
+    if footer:
+        cv2.putText(frame, footer, (10, h - 10), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.5, (255, 255, 255), 1)
     return frame

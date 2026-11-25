@@ -1,19 +1,30 @@
 """
 Audio Alert Module for Driver Monitoring System
-Provides audio warnings for fatigue detection.
+
+Beeps (pygame) and optional voice warnings (pyttsx3). Everything degrades
+gracefully: with no audio device (headless/CI), or if pygame/pyttsx3 are not
+installed, alerts fall back to the terminal bell or are silently skipped and the
+detection loop is never affected.
+
+All sound is produced on ONE background worker thread, so the main video loop
+never blocks and the (non thread-safe) audio engines are only touched from a
+single thread. If the worker is busy, new alerts are dropped instead of queued,
+which prevents a backlog of stale warnings.
 """
 
-import os
-import threading
-import time
-from typing import Optional
+import queue
 import sys
+import threading
+from typing import Optional, Tuple
 
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from utils.config import ALERT_CONFIG
+import numpy as np
+
+from ..utils.config import ALERT_CONFIG
 
 # Optional imports - gracefully handle missing packages
 try:
+    import os as _os
+    _os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
     import pygame
     PYGAME_AVAILABLE = True
 except ImportError:
@@ -25,195 +36,143 @@ try:
 except ImportError:
     PYTTSX3_AVAILABLE = False
 
+SAMPLE_RATE = 22050
+
+
+def generate_beep_samples(frequency: int, duration: float) -> np.ndarray:
+    """Stereo int16 sine beep with a 10 ms fade in/out (no clicks)."""
+    n = max(int(SAMPLE_RATE * duration), 1)
+    t = np.linspace(0, duration, n, endpoint=False)
+    wave = np.sin(2 * np.pi * frequency * t)
+    fade = min(int(SAMPLE_RATE * 0.01), n // 2)
+    if fade > 0:
+        envelope = np.ones(n)
+        envelope[:fade] = np.linspace(0, 1, fade)
+        envelope[-fade:] = np.linspace(1, 0, fade)
+        wave = wave * envelope
+    mono = (wave * 32767 * 0.8).astype(np.int16)
+    return np.column_stack((mono, mono))
+
 
 class AudioAlert:
-    """
-    Audio alert system using pygame for beeps and pyttsx3 for voice.
-    Falls back to system beep if packages are not available.
-    """
-    
+    """Thread-safe, failure-tolerant audio alerts."""
+
+    messages = {
+        'drowsy_warning': "Warning! You appear drowsy. Please take a break.",
+        'drowsy_critical': "Alert! Severe drowsiness detected! Pull over immediately!",
+        'yawn': "Yawning detected. Consider taking a break.",
+        'distracted': "Please keep your eyes on the road.",
+        'no_face': "Driver not detected. Please face the camera.",
+    }
+
     def __init__(self, enable_voice: bool = True):
-        """
-        Initialize audio alert system.
-        
-        Args:
-            enable_voice: Whether to enable text-to-speech alerts
-        """
         self.enable_voice = enable_voice and PYTTSX3_AVAILABLE
-        self._initialized = False
-        self._last_alert_time = 0
-        self._cooldown = ALERT_CONFIG.ALERT_COOLDOWN
-        
-        # Initialize pygame mixer
+        self.backend = "none"
+        self._mixer_ok = False
+        self._tts_engine = None
+        self._closed = False
+
         if PYGAME_AVAILABLE:
             try:
-                pygame.mixer.init(frequency=22050, size=-16, channels=2, buffer=512)
-                self._initialized = True
-            except Exception as e:
-                print(f"Warning: Could not initialize pygame mixer: {e}")
-        
-        # Initialize text-to-speech
-        self._tts_engine = None
-        if self.enable_voice:
-            try:
-                self._tts_engine = pyttsx3.init()
-                self._tts_engine.setProperty('rate', 150)
-                self._tts_engine.setProperty('volume', 1.0)
-            except Exception as e:
-                print(f"Warning: Could not initialize TTS: {e}")
-                self._tts_engine = None
-        
-        # Alert messages
-        self.messages = {
-            'drowsy_warning': "Warning! You appear drowsy. Please take a break.",
-            'drowsy_critical': "Alert! Severe drowsiness detected! Pull over immediately!",
-            'yawn': "Yawning detected. Consider taking a break.",
-            'distracted': "Please keep your eyes on the road.",
-            'no_face': "Driver not detected. Please face the camera."
-        }
-    
-    def _can_alert(self) -> bool:
-        """Check if enough time has passed since last alert."""
-        current_time = time.time()
-        if current_time - self._last_alert_time >= self._cooldown:
-            self._last_alert_time = current_time
-            return True
-        return False
-    
-    def _generate_beep(self, frequency: int, duration: float) -> Optional[object]:
-        """
-        Generate a beep sound using pygame.
-        
-        Args:
-            frequency: Beep frequency in Hz
-            duration: Duration in seconds
-            
-        Returns:
-            pygame Sound object or None
-        """
-        if not PYGAME_AVAILABLE or not self._initialized:
-            return None
-        
-        import numpy as np
-        
-        sample_rate = 22050
-        n_samples = int(sample_rate * duration)
-        
-        # Generate sine wave
-        t = np.linspace(0, duration, n_samples, False)
-        wave = np.sin(2 * np.pi * frequency * t)
-        
-        # Apply envelope to avoid clicks
-        envelope = np.ones(n_samples)
-        fade_samples = int(sample_rate * 0.01)  # 10ms fade
-        envelope[:fade_samples] = np.linspace(0, 1, fade_samples)
-        envelope[-fade_samples:] = np.linspace(1, 0, fade_samples)
-        wave = wave * envelope
-        
-        # Convert to 16-bit audio
-        wave = (wave * 32767).astype(np.int16)
-        
-        # Create stereo by duplicating
-        stereo_wave = np.column_stack((wave, wave))
-        
-        # Create pygame sound
-        sound = pygame.sndarray.make_sound(stereo_wave)
-        return sound
-    
-    def beep(self, frequency: int = 800, duration: float = 0.3):
-        """
-        Play a beep sound.
-        
-        Args:
-            frequency: Beep frequency in Hz
-            duration: Duration in seconds
-        """
-        if not self._can_alert():
+                pygame.mixer.init(frequency=SAMPLE_RATE, size=-16, channels=2, buffer=512)
+                self._mixer_ok = True
+                self.backend = "pygame"
+            except Exception as exc:  # no audio device, headless, driver error...
+                print(f"Warning: audio device unavailable ({exc}); using terminal bell.")
+        if not self._mixer_ok:
+            self.backend = "terminal-bell"
+
+        # Single worker thread owns the mixer playback and the TTS engine
+        self._queue: "queue.Queue[Optional[Tuple[int, float, Optional[str]]]]" = queue.Queue(maxsize=1)
+        self._worker = threading.Thread(target=self._run, name="dms-audio", daemon=True)
+        self._worker.start()
+
+    # ------------------------------------------------------------------ worker
+    def _init_tts(self):
+        if not self.enable_voice:
             return
-        
-        if PYGAME_AVAILABLE and self._initialized:
-            sound = self._generate_beep(frequency, duration)
-            if sound:
-                sound.play()
-        else:
-            # Fallback: system beep (Mac/Linux)
-            print('\a')
-    
-    def warning_beep(self):
-        """Play warning beep."""
-        self.beep(ALERT_CONFIG.WARNING_BEEP_FREQ, ALERT_CONFIG.BEEP_DURATION)
-    
-    def critical_beep(self):
-        """Play critical/alarm beep."""
-        self.beep(ALERT_CONFIG.CRITICAL_BEEP_FREQ, ALERT_CONFIG.BEEP_DURATION * 2)
-    
-    def speak(self, message: str, blocking: bool = False):
-        """
-        Speak a message using text-to-speech.
-        
-        Args:
-            message: Text to speak
-            blocking: Whether to wait for speech to complete
-        """
-        if not self._tts_engine:
-            return
-        
-        if blocking:
-            self._tts_engine.say(message)
-            self._tts_engine.runAndWait()
-        else:
-            # Run in background thread
-            thread = threading.Thread(target=self._speak_async, args=(message,))
-            thread.daemon = True
-            thread.start()
-    
-    def _speak_async(self, message: str):
-        """Async speech helper."""
         try:
-            self._tts_engine.say(message)
-            self._tts_engine.runAndWait()
-        except Exception:
-            pass
-    
-    def alert_drowsy(self, severity: str = 'warning'):
-        """
-        Alert for drowsiness detection.
-        
-        Args:
-            severity: 'warning' or 'critical'
-        """
-        if severity == 'critical':
-            self.critical_beep()
-            if self.enable_voice:
-                self.speak(self.messages['drowsy_critical'])
+            self._tts_engine = pyttsx3.init()
+            self._tts_engine.setProperty('rate', 150)
+            self._tts_engine.setProperty('volume', 1.0)
+        except Exception as exc:
+            print(f"Warning: text-to-speech unavailable ({exc}); voice alerts disabled.")
+            self._tts_engine = None
+            self.enable_voice = False
+
+    def _run(self):
+        self._init_tts()
+        while True:
+            item = self._queue.get()
+            if item is None:
+                break
+            frequency, duration, speech = item
+            try:
+                self._play_beep(frequency, duration)
+                if speech and self._tts_engine is not None:
+                    self._tts_engine.say(speech)
+                    self._tts_engine.runAndWait()
+            except Exception:
+                pass  # audio must never take the monitor down
+
+    def _play_beep(self, frequency: int, duration: float):
+        if self._mixer_ok:
+            sound = pygame.sndarray.make_sound(generate_beep_samples(frequency, duration))
+            channel = sound.play()
+            if channel is not None:
+                while channel.get_busy() and not self._closed:
+                    pygame.time.wait(20)
         else:
-            self.warning_beep()
-            if self.enable_voice:
-                self.speak(self.messages['drowsy_warning'])
-    
-    def alert_yawn(self):
-        """Alert for yawn detection."""
-        self.warning_beep()
-        if self.enable_voice:
-            self.speak(self.messages['yawn'])
-    
-    def alert_distracted(self):
-        """Alert for distraction detection."""
-        self.warning_beep()
-        if self.enable_voice:
-            self.speak(self.messages['distracted'])
-    
-    def alert_no_face(self):
-        """Alert when driver face is not detected."""
-        self.beep(600, 0.2)
-        if self.enable_voice:
-            self.speak(self.messages['no_face'])
-    
+            sys.stdout.write('\a')
+            sys.stdout.flush()
+
+    # --------------------------------------------------------------------- API
+    def _submit(self, frequency: int, duration: float, speech: Optional[str]) -> bool:
+        """Queue a sound; returns False (and drops it) if the worker is busy."""
+        if self._closed:
+            return False
+        try:
+            self._queue.put_nowait((frequency, duration, speech if self.enable_voice else None))
+            return True
+        except queue.Full:
+            return False
+
+    def alert_drowsy(self, severity: str = 'warning') -> bool:
+        if severity == 'critical':
+            return self._submit(ALERT_CONFIG.CRITICAL_BEEP_FREQ, ALERT_CONFIG.BEEP_DURATION * 2,
+                                self.messages['drowsy_critical'])
+        return self._submit(ALERT_CONFIG.WARNING_BEEP_FREQ, ALERT_CONFIG.BEEP_DURATION,
+                            self.messages['drowsy_warning'])
+
+    def alert_yawn(self) -> bool:
+        return self._submit(ALERT_CONFIG.WARNING_BEEP_FREQ, ALERT_CONFIG.BEEP_DURATION, self.messages['yawn'])
+
+    def alert_distracted(self) -> bool:
+        return self._submit(ALERT_CONFIG.WARNING_BEEP_FREQ, ALERT_CONFIG.BEEP_DURATION, self.messages['distracted'])
+
+    def alert_no_face(self) -> bool:
+        return self._submit(600, 0.2, self.messages['no_face'])
+
     def close(self):
-        """Clean up resources."""
-        if PYGAME_AVAILABLE and self._initialized:
-            pygame.mixer.quit()
-        if self._tts_engine:
+        """Stop the worker and release audio resources."""
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            self._queue.put_nowait(None)
+        except queue.Full:
+            try:
+                self._queue.get_nowait()
+                self._queue.put_nowait(None)
+            except (queue.Empty, queue.Full):
+                pass
+        self._worker.join(timeout=2.0)
+        if self._mixer_ok:
+            try:
+                pygame.mixer.quit()
+            except Exception:
+                pass
+        if self._tts_engine is not None:
             try:
                 self._tts_engine.stop()
             except Exception:
